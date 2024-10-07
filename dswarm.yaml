@@ -1,0 +1,702 @@
+- name: Ping and print play
+  hosts: manager1:worker1
+  tasks:
+    - name: Ping my nodes
+      ansible.builtin.ping:
+      register: ping_result
+      tags: pong
+
+    - name: Print ping result
+      ansible.builtin.debug:
+        var: ping_result.ping
+      tags: pong
+
+    - name: Print message
+      ansible.builtin.debug:
+        msg: "Holla {{ ansible_facts['hostname'] }}"
+      tags: pong
+
+- name: Add public key to remote hosts play
+  hosts: manager1:worker1
+  tasks:
+    - name: Set authorized key taken from file
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user }}"
+        state: present
+        key: "{{ lookup('file', '/home/aelia/.ssh/id_rsa.pub') }}"
+      tags: pubkey
+
+    - name: Print out the authorized_keys
+      ansible.builtin.command:
+        cmd: cat /home/vagrant/.ssh/authorized_keys
+      register: output
+      changed_when: false
+      tags: pubkey
+
+    - name: Show output
+      ansible.builtin.debug:
+        var: output.stdout_lines
+      tags: pubkey
+
+- name: Update & Upgrade and install required packages on nodes
+  hosts: manager1:worker1
+  become: true
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Upgrade all packages
+      ansible.builtin.apt:
+        upgrade: 'yes'
+        autoremove: true
+        autoclean: true
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+          - tar
+          - wireguard-tools
+        state: present
+        update_cache: true
+
+- name: Disable swap permanently
+  hosts: manager1:worker1
+  become: true
+  tasks:
+    - name: Get swap partitions
+      ansible.builtin.command:
+        cmd: swapon --show=NAME --noheadings
+      register: swap_partitions
+      changed_when: false
+
+    - name: Turn off swap
+      ansible.builtin.command:
+        cmd: swapoff {{ item }}
+      with_items: "{{ swap_partitions.stdout_lines }}"
+      when: swap_partitions.stdout_lines | length > 0
+      notify: Reload sysctl
+      changed_when: false
+
+    - name: Remove swap entry from /etc/fstab
+      ansible.posix.mount:
+        path: "{{ item }}"
+        src: "{{ item }}"
+        fstype: swap
+        state: absent
+      with_items: "{{ swap_partitions.stdout_lines }}"
+      when: swap_partitions.stdout_lines | length > 0
+
+  handlers:
+    - name: Reload sysctl
+      ansible.builtin.command:
+        cmd: sysctl -p
+      changed_when: false
+
+- name: Sysctl params required by setup, params persist across reboots
+  hosts: manager1:worker1
+  become: true
+  tasks:
+    - name: Create /etc/sysctl.d/k8s.conf
+      ansible.builtin.copy:
+        content: |
+          net.ipv4.ip_forward = 1
+        dest: /etc/sysctl.d/k8s.conf
+        mode: '0644'
+
+    - name: Apply sysctl params without reboot
+      ansible.posix.sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        state: present
+        reload: true
+
+    - name: Verify sysctl param
+      ansible.builtin.command: sysctl net.ipv4.ip_forward
+      register: sysctl_info
+      changed_when: false
+
+    - name: Display sysctl param
+      ansible.builtin.debug:
+        var: sysctl_info
+
+- name: Install containerd as cri
+  hosts: manager1:worker1
+  become: true
+  tasks:
+    - name: Download containerd
+      ansible.builtin.get_url:
+        url: https://github.com/containerd/containerd/releases/download/v2.0.0-rc.2/containerd-2.0.0-rc.2-linux-amd64.tar.gz
+        dest: /tmp/containerd-2.0.0-rc.2-linux-amd64.tar.gz
+        mode: '0644'
+      register: download_containerd
+      changed_when: download_containerd.status_code == 200
+
+    - name: Extract containerd
+      ansible.builtin.unarchive:
+        src: /tmp/containerd-2.0.0-rc.2-linux-amd64.tar.gz
+        dest: /usr/local
+        remote_src: true
+
+    - name: Create systemd system directory
+      ansible.builtin.file:
+        path: /usr/local/lib/systemd/system
+        state: directory
+        mode: '0755'
+
+    - name: Download containerd service file
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/containerd/containerd/main/containerd.service
+        dest: /usr/local/lib/systemd/system/containerd.service
+        mode: '0644'
+
+    - name: Reload systemd manager configuration
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start containerd service
+      ansible.builtin.systemd:
+        name: containerd
+        enabled: true
+        state: started
+
+- name: Install runc
+  hosts: manager1:worker1
+  become: true
+  tasks:
+    - name: Download runc
+      ansible.builtin.get_url:
+        url: https://github.com/opencontainers/runc/releases/download/v1.2.0-rc.2/runc.amd64
+        dest: /tmp/runc.amd64
+        mode: '0755'
+
+    - name: Install runc
+      ansible.builtin.copy:
+        src: /tmp/runc.amd64
+        dest: /usr/local/sbin/runc
+        mode: '0755'
+        remote_src: true
+
+- name: Install CNI plugins
+  hosts: manager1:worker1
+  become: true
+  tasks:
+    - name: Download CNI plugins
+      ansible.builtin.get_url:
+        url: https://github.com/containernetworking/plugins/releases/download/v1.5.1/cni-plugins-linux-amd64-v1.5.1.tgz
+        dest: /tmp/cni-plugins-linux-amd64-v1.5.1.tgz
+        mode: '0644'
+
+    - name: Create /opt/cni/bin directory
+      ansible.builtin.file:
+        path: /opt/cni/bin
+        state: directory
+        mode: '0755'
+
+    - name: Extract CNI plugins
+      ansible.builtin.unarchive:
+        src: /tmp/cni-plugins-linux-amd64-v1.5.1.tgz
+        dest: /opt/cni/bin
+        remote_src: true
+
+- name: Setup kubernetes on manager1, and worker1
+  hosts: manager1:worker1
+  become: true
+  tasks:
+    - name: Create directory for apt keyrings
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add k8s keyring
+      ansible.builtin.get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key
+        dest: /tmp/Release.key
+        mode: '0644'
+      # register: download_k8skey
+      # changed_when: download_k8skey.status_code == 200
+
+    - name: Import k8s keyring
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/Release.key
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        executable: /bin/bash
+
+    - name: Add k8s source list
+      ansible.builtin.copy:
+        content: 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /'
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install kubelet, kubeadm, and kubectl
+      ansible.builtin.apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Hold kubelet, kubeadm, and kubectl
+      ansible.builtin.apt:
+        name: "{{ item }}"
+        state: present
+        dpkg_options: 'hold'
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+- name: Setup node ip of worker1
+  hosts: worker1
+  become: true
+  tasks:
+    - name: Set kubelet extra args
+      ansible.builtin.lineinfile:
+        path: /etc/default/kubelet
+        line: "KUBELET_EXTRA_ARGS=\"--node-ip={{ ansible_host }}\""
+        create: true
+        mode: '0644'
+      become: true
+
+    - name: Reload systemd manager configuration
+      ansible.builtin.systemd:
+        daemon_reload: true
+      become: true
+
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+      become: true
+
+- name: Install python packages
+  hosts: manager1:worker1
+  become: true
+  tasks:
+    - name: Ensure Python is installed
+      ansible.builtin.apt:
+        name: python3
+        state: present
+      become: true
+
+    - name: Ensure pip is installed
+      ansible.builtin.apt:
+        name: python3-pip
+        state: present
+      become: true
+
+    - name: Ensure kubernetes Python library is installed
+      ansible.builtin.pip:
+        name: kubernetes
+        state: present
+      become: true
+
+- name: Setup node ip of control, kubernetes on manager1, and worker1
+  hosts: manager1
+  become: true
+  tasks:
+    - name: Set kubelet extra args
+      ansible.builtin.lineinfile:
+        path: /etc/default/kubelet
+        line: 'KUBELET_EXTRA_ARGS="--node-ip=192.168.50.4"'
+        create: true
+        mode: '0644'
+      become: true
+
+    - name: Reload systemd manager configuration
+      ansible.builtin.systemd:
+        daemon_reload: true
+      become: true
+
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+      become: true
+
+    - name: Check if Kubernetes is already initialized
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_config
+
+    - name: Initialize Kubernetes
+      ansible.builtin.command:
+        cmd: sudo kubeadm init --apiserver-advertise-address=192.168.50.4 --pod-network-cidr=10.244.0.0/16
+      register: kubeadm_output
+      changed_when: false
+      when: not kubelet_config.stat.exists
+
+    - name: Display kubeadm output
+      ansible.builtin.debug:
+        var: kubeadm_output.stdout_lines
+
+    - name: Extract join command
+      ansible.builtin.set_fact:
+        join_command: "{{ kubeadm_output.stdout_lines | select('match', '^kubeadm join .*') | list | join('') | regex_replace(' \\\\$', '') }}"
+
+    - name: Display join command
+      ansible.builtin.debug:
+        var: join_command
+
+    - name: Extract discovery token
+      ansible.builtin.set_fact:
+        discovery_token: >
+          {{ kubeadm_output.stdout_lines
+          | select('match', '^.*--discovery-token-ca-cert-hash .*')
+          | list
+          | join(' ')
+          | regex_replace('^\\s+', '')
+          | regex_replace('\\s+$', '') }}
+
+    - name: Display discovery token
+      ansible.builtin.debug:
+        var: discovery_token
+
+    - name: Clean join command
+      ansible.builtin.set_fact:
+        clean_join_command: "{{ join_command }} {{ discovery_token }}"
+
+    - name: Display clean join command
+      ansible.builtin.debug:
+        var: clean_join_command
+
+- name: Setup Copying
+  hosts: manager1
+  become: true
+  tasks:
+    - name: Create .kube directory in home
+      ansible.builtin.file:
+        path: "/home/vagrant/.kube"
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: '0700'
+
+    - name: Copy admin.conf to .kube directory
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/vagrant/.kube/config
+        owner: vagrant
+        group: vagrant
+        mode: '0600'
+        force: true
+        remote_src: true
+
+- name: Copypasting
+  hosts: manager1
+  tasks:
+    - name: Check if node is part of the cluster
+      ansible.builtin.shell:
+        cmd: KUBECONFIG=/home/vagrant/.kube/config kubectl get nodes | grep -w {{ item }} || echo "not_in_cluster"
+        executable: /bin/bash
+      register: node_status
+      changed_when: false
+      ignore_errors: true
+      loop:
+        - worker1
+
+    - name: Set fact for each node
+      ansible.builtin.set_fact:
+        nodes_not_in_cluster: "{{ nodes_not_in_cluster | default([]) + [item.item] }}"
+      when: "'not_in_cluster' in item.stdout"
+      loop: "{{ node_status.results }}"
+
+- name: Join worker1 to cluster
+  hosts: worker1
+  become: true
+  tasks:
+    - name: Join cluster
+      ansible.builtin.command:
+        cmd: "sudo {{ hostvars['manager1']['clean_join_command'] }}"
+      when: inventory_hostname in hostvars['manager1']['nodes_not_in_cluster']
+      changed_when: true
+
+- name: Create kubectl of manager1, install python, & output status
+  hosts: manager1
+  become: true
+  tasks:
+    - name: Download tigera operator
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml
+        dest: /home/vagrant/tigera-operator.yaml
+        mode: '0664'
+
+    - name: Create tigera operator
+      ansible.builtin.shell:
+        cmd: KUBECONFIG=/home/vagrant/.kube/config kubectl create -f /home/vagrant/tigera-operator.yaml
+        executable: /bin/bash
+      become: true
+      changed_when: false
+
+    - name: Download custom resources
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/custom-resources.yaml
+        dest: /home/vagrant/custom-resources.yaml
+        mode: '0664'
+
+    - name: Replace IP address in custom resources
+      ansible.builtin.replace:
+        path: /home/vagrant/custom-resources.yaml
+        regexp: '192.168.0.0/16'
+        replace: '10.244.0.0/16'
+
+    - name: Create custom resources
+      ansible.builtin.shell:
+        cmd: KUBECONFIG=/home/vagrant/.kube/config kubectl create -f /home/vagrant/custom-resources.yaml
+        executable: /bin/bash
+      become: true
+      changed_when: false
+
+    - name: Check if all pods are initialized
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: '{{ item }}'
+        kubeconfig: /home/vagrant/.kube/config
+      register: pods
+      loop:
+        - calico-apiserver
+        - calico-system
+        - kube-system
+        - tigera-operator
+
+    - name: Check readiness of all pods manually
+      ansible.builtin.shell: |
+        set -o pipefail
+        KUBECONFIG=/home/vagrant/.kube/config kubectl get pods -A > watchingpods.txt
+        while grep -qE '0/1|0/2|1/2' watchingpods.txt; do
+          sleep 10
+          KUBECONFIG=/home/vagrant/.kube/config kubectl get pods -A > watchingpods.txt
+        done
+      args:
+        executable: /bin/bash
+      register: result
+      changed_when: "'0/1' in result.stdout or '0/2' in result.stdout or '1/2' in result.stdout"
+
+    - name: Taint nodes
+      ansible.builtin.shell:
+        cmd: KUBECONFIG=/home/vagrant/.kube/config kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+        executable: /bin/bash
+      register: taint_output
+      changed_when: false
+      ignore_errors: true
+
+    - name: Show taint output
+      ansible.builtin.debug:
+        var: taint_output.stdout_lines
+
+    - name: Get nodes
+      ansible.builtin.shell:
+        cmd: KUBECONFIG=/home/vagrant/.kube/config kubectl get nodes -owide
+        executable: /bin/bash
+      register: nodes_output
+      changed_when: false
+
+    - name: Show nodes output
+      ansible.builtin.debug:
+        var: nodes_output.stdout_lines
+
+    - name: Get pods
+      ansible.builtin.shell:
+        cmd: KUBECONFIG=/home/vagrant/.kube/config kubectl get pods -A
+        executable: /bin/bash
+      register: pods_output
+      changed_when: false
+
+    - name: Show pods output
+      ansible.builtin.debug:
+        var: pods_output.stdout_lines
+
+- name: Install calicoctl pada control & local
+  hosts: manager1:localhost
+  tasks:
+    - name: Download calicoctl
+      ansible.builtin.get_url:
+        url: https://github.com/projectcalico/calico/releases/download/v3.28.0/calicoctl-linux-amd64
+        dest: "{{ ansible_env.HOME }}/calicoctl"
+        mode: '0777'
+      register: download_calicoctl
+      changed_when: download_calicoctl.status_code == 200
+
+    - name: Change owner and group of calicoctl
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/calicoctl"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0777'
+
+    - name: Move calicoctl to /usr/local/bin
+      ansible.builtin.copy:
+        src: "{{ ansible_env.HOME }}/calicoctl"
+        dest: "/usr/local/bin/calicoctl"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0777'
+        force: true
+        remote_src: true
+      become: true
+
+- name: Fetch kube config from manager1
+  hosts: manager1
+  tasks:
+    - name: Fetch .kube/config from manager1
+      ansible.builtin.fetch:
+        src: /home/vagrant/.kube/config
+        dest: /home/aelia/.kube/
+        flat: true
+        owner: aelia
+        group: aelia
+        force: true
+        remote_src: true
+
+- name: Configure Kubernetes ipvs and Install Ingress Controller
+  hosts: manager1
+  tasks:
+    - name: Get kube-proxy ConfigMap
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: ConfigMap
+        namespace: kube-system
+        name: kube-proxy
+        kubeconfig: /home/vagrant/.kube/config
+      register: kube_proxy_configmap
+
+    - name: Debug ConfigMap content
+      ansible.builtin.debug:
+        var: kube_proxy_configmap
+
+    - name: Modify mode to ipvs and strictARP to true
+      ansible.builtin.set_fact:
+        modified_config: >-
+          {{ kube_proxy_configmap.resources[0].data['config.conf'] |
+             regex_replace('mode: ""', 'mode: "ipvs"') |
+             regex_replace('strictARP: false', 'strictARP: true') }}
+
+    - name: Update kube-proxy ConfigMap
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: ConfigMap
+        namespace: kube-system
+        name: kube-proxy
+        definition:
+          data:
+            config.conf: "{{ modified_config }}"
+        kubeconfig: /home/vagrant/.kube/config
+
+- name: Configure Kubernetes ipvs and Install Ingress Controller
+  hosts: localhost
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+    - name: Install Kubernetes Python package
+      ansible.builtin.pip:
+        name: kubernetes
+        executable: pip3
+
+    - name: Apply MetalLB manifests
+      kubernetes.core.k8s:
+        state: present
+        src: https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
+
+    - name: Ensure Helm is installed
+      ansible.builtin.command:
+        cmd: helm version
+      register: helm_version
+      changed_when: false
+      failed_when: helm_version.rc != 0
+
+    - name: Add ingress-nginx Helm repo
+      kubernetes.core.helm_repository:
+        name: ingress-nginx
+        repo_url: https://kubernetes.github.io/ingress-nginx
+
+    - name: Update Helm repo
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+
+    - name: Install ingress-nginx using Helm
+      kubernetes.core.helm:
+        name: ingress-nginx
+        chart_ref: ingress-nginx/ingress-nginx
+        release_namespace: ingress-nginx
+        create_namespace: true
+        values: {}
+        state: present
+
+- name: Install and create nfs-server dir to mount as server
+  hosts: manager1
+  become: true
+  tasks:
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - nfs-kernel-server
+        state: present
+
+    - name: Create vite-cache directory
+      ansible.builtin.file:
+        path: /mnt/data/vite-cache
+        state: directory
+        owner: nobody
+        group: nogroup
+        mode: '0777'
+
+    - name: Add NFS export
+      ansible.builtin.lineinfile:
+        path: /etc/exports
+        line: '/mnt/data/vite-cache  *(rw,sync,no_subtree_check)'
+        state: present
+      notify: Export NFS shares
+
+  handlers:
+    - name: Export NFS shares
+      ansible.builtin.command:
+        cmd: exportfs -a
+        creates: /var/nfs_exports_updated
+      become: true
+      listen: "Export NFS shares"
+
+    - name: Restart NFS server
+      ansible.builtin.systemd:
+        name: nfs-kernel-server
+        state: restarted
+      become: true
+      listen: "Restart NFS server"
+
+- name: Install and create nfs-common dir to mount to manager1
+  hosts: worker1
+  become: true
+  tasks:
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - nfs-common
+        state: present
+
+    - name: Create vite-cache directory
+      ansible.builtin.file:
+        path: /mnt/data/vite-cache
+        state: directory
+        owner: nobody
+        group: nogroup
+        mode: '0777'
+
+    - name: Mount NFS share
+      ansible.posix.mount:
+        path: /mnt/data/vite-cache
+        src: 192.168.50.4:/mnt/data/vite-cache
+        fstype: nfs
+        state: mounted
