@@ -1,3 +1,17 @@
+- name: Playbook for Localhost
+  hosts: local
+  tasks:
+    - name: Del IP first
+      ansible.builtin.command: /home/aelia/docker_swarm_practice/dellocal.sh
+      changed_when: false
+
+- name: SSHing
+  hosts: local
+  tasks:
+    - name: SSH before everything
+      ansible.builtin.command: /home/aelia/docker_swarm_practice/automatessh.sh
+      changed_when: false
+
 - name: Ping and print play
   hosts: manager1:worker1
   tasks:
@@ -16,53 +30,127 @@
         msg: "Holla {{ ansible_facts['hostname'] }}"
       tags: pong
 
-# - name: Add public key to remote hosts play
-#   hosts: manager1:worker1
-#   tasks:
-#     - name: Set authorized key taken from file
-#       ansible.posix.authorized_key:
-#         user: "{{ ansible_user }}"
-#         state: present
-#         key: "{{ lookup('file', '/home/aelia/.ssh/id_rsa.pub') }}"
-#       tags: pubkey
+- name: Update & Upgrade and install required packages on nodes
+  hosts: manager1:worker1
+  become: true
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
 
-#     - name: Print out the authorized_keys
-#       ansible.builtin.command:
-#         cmd: cat /home/vagrant/.ssh/authorized_keys
-#       register: output
-#       changed_when: false
-#       tags: pubkey
+    - name: Upgrade all packages
+      ansible.builtin.apt:
+        upgrade: 'yes'
+        autoremove: true
+        autoclean: true
 
-#     - name: Show output
-#       ansible.builtin.debug:
-#         var: output.stdout_lines
-#       tags: pubkey
+    - name: Ensure Docker's official GPG key directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
 
-# - name: Update & Upgrade and install required packages on nodes
-#   hosts: manager1:worker1
-#   become: true
-#   tasks:
-#     - name: Update apt cache
-#       ansible.builtin.apt:
-#         update_cache: true
+    - name: Download Docker's official GPG key
+      ansible.builtin.shell:
+        cmd: |
+          #!/bin/bash
+          set -o pipefail
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          sudo chmod a+r /etc/apt/keyrings/docker.asc
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+          https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo \"$VERSION_CODENAME\") stable" | \
+          sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+        creates: /etc/apt/keyrings/docker.asc
+        executable: /bin/bash
+      become: true
 
-#     - name: Upgrade all packages
-#       ansible.builtin.apt:
-#         upgrade: 'yes'
-#         autoremove: true
-#         autoclean: true
+    - name: Update apt cache after adding Docker repository
+      ansible.builtin.apt:
+        update_cache: true
 
-#     - name: Install required packages
-#       ansible.builtin.apt:
-#         name:
-#           - apt-transport-https
-#           - ca-certificates
-#           - curl
-#           - gpg
-#           - tar
-#           - wireguard-tools
-#         state: present
-#         update_cache: true
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+          - docker-compose
+        state: present
+        update_cache: true
+
+- name: Update & Upgrade and install required packages on nodes
+  hosts: manager1:worker1
+  become: true
+  tasks:
+    - name: Create docker group if it doesn't exist
+      ansible.builtin.group:
+        name: docker
+        state: present
+
+    - name: Add user to docker group
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: true
+
+- name: Starting Swarm
+  hosts: manager1
+  become: true
+  tasks:
+    - name: Check if Docker Swarm is already initialized
+      ansible.builtin.command:
+        cmd: docker info --format '{{ "{{ .Swarm.LocalNodeState }}" }}'
+      register: swarm_status
+      changed_when: false
+
+    - name: Initialize Docker Swarm
+      ansible.builtin.command:
+        cmd: docker swarm init --advertise-addr {{ ansible_host }}
+      when: swarm_status.stdout != "active"
+      register: swarm_init
+      changed_when: false
+
+    - name: Display swarm init output
+      ansible.builtin.debug:
+        var: swarm_init.stdout_lines
+      when: swarm_status.stdout != "active"
+
+    - name: Extract join token
+      ansible.builtin.command:
+        cmd: docker swarm join-token worker -q
+      register: join_token
+      changed_when: false
+
+    - name: Set join token fact
+      ansible.builtin.set_fact:
+        join_token: "{{ join_token.stdout }}"
+
+    - name: Display join token
+      ansible.builtin.debug:
+        var: join_token
+
+- name: Join Swarm as Worker
+  hosts: worker1
+  become: true
+  tasks:
+    - name: Check if Docker Swarm is already initialized on worker
+      ansible.builtin.command:
+        cmd: docker info --format '{{ "{{ .Swarm.LocalNodeState }}" }}'
+      register: worker_swarm_status
+      changed_when: false
+
+    - name: Join Docker Swarm
+      ansible.builtin.command:
+        cmd: docker swarm join --token {{ hostvars['manager1']['join_token'] }} {{ hostvars['manager1']['ansible_host'] }}:2377
+      when: worker_swarm_status.stdout != "active"
+      changed_when: false
 
 # - name: Disable swap permanently
 #   hosts: manager1:worker1

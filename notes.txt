@@ -1,0 +1,8 @@
+ansible-playbook -i inventory.yaml -e ansible_ssh_private_key_file=./vagrant.key.rsa dswarm.yaml
+
+ansible-playbook -i inventory.yaml -e ansible_ssh_private_key_file=./vagrant.key.rsa dswarm.yaml --start-at-task="Create docker group if it doesn't exist"
+
+ ssh -i vagrant.key.rsa vagrant@192.168.50.10
+ ssh -i vagrant.key.rsa vagrant@192.168.50.11
+
+ code /home/aelia/.ssh/known_hosts
