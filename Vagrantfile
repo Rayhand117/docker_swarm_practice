@@ -7,7 +7,7 @@ Vagrant.configure("2") do |config|
   machine_names.each_with_index do |machine_name, i|
     config.vm.define machine_name do |machine|
       machine.vm.hostname = machine_name
-      machine.vm.network "private_network", ip: "192.168.50.#{i+4}", auto_correct: true
+      machine.vm.network "private_network", ip: "192.168.50.#{i+10}", auto_correct: true
 
       machine.vm.provision "shell", inline: <<-SHELL
         sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
